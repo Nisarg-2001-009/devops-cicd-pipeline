@@ -1,0 +1,574 @@
+// jenkins/Jenkinsfile
+// ---------------------------------------------------------------------------
+// Declarative Pipeline for devops-cicd-pipeline
+// ---------------------------------------------------------------------------
+// Jenkins supports two pipeline syntaxes: Scripted (Groovy-first) and
+// Declarative. We use Declarative because it enforces a well-defined
+// structure (pipeline > agent > stages > steps), catches configuration
+// errors at parse time, and is far easier to read and review.
+//
+// This file lives in the jenkins/ subdirectory. Point your Jenkins job's
+// "Script Path" setting to "jenkins/Jenkinsfile" (Pipeline > Pipeline script
+// from SCM) so Jenkins loads it from the repository rather than the UI.
+// ---------------------------------------------------------------------------
+
+pipeline {
+
+    // -------------------------------------------------------------------------
+    // agent
+    // -------------------------------------------------------------------------
+    // Declares WHERE the pipeline runs. `agent any` tells Jenkins to schedule
+    // the build on any available executor (any node). In a multi-node setup
+    // you could write `agent { label 'docker' }` to restrict execution to
+    // nodes that have Docker installed. We use `any` to stay generic.
+    // -------------------------------------------------------------------------
+    agent any
+
+    // -------------------------------------------------------------------------
+    // environment
+    // -------------------------------------------------------------------------
+    // Pipeline-wide environment variables made available to every stage and
+    // step as if they were exported shell variables. Centralising them here
+    // means you only need to change one value instead of hunting through every
+    // `sh` command if the image name or app name changes.
+    //
+    // GIT_COMMIT is a built-in Jenkins variable populated automatically during
+    // the Checkout stage. We derive IMAGE_TAG from it so every image build is
+    // uniquely and traceably labelled with the exact source commit it was built
+    // from. This is the foundation of immutable image tagging — a best practice
+    // that makes rollbacks and audit trails trivial.
+    // -------------------------------------------------------------------------
+    environment {
+        // The Docker Hub repository to push images to.
+        // Format: <dockerhub-username>/<repository-name>
+        DOCKER_IMAGE = "nisarg2001009/devops-cicd-pipeline"
+
+        // A human-readable name used for the running container and log messages.
+        APP_NAME = "devops-cicd-pipeline"
+
+        // The container name used on the deploy host. Keeping it constant means
+        // subsequent deployments always replace exactly one named container,
+        // preventing container sprawl.
+        CONTAINER_NAME = "devops-cicd-app"
+
+        // Short (7-character) git SHA derived from the full GIT_COMMIT variable
+        // that Jenkins populates. Using the short SHA keeps image tags concise
+        // while still being unique and traceable. The `take(7)` call trims the
+        // 40-character full hash to the conventional short form.
+        IMAGE_TAG = "${GIT_COMMIT.take(7)}"
+    }
+
+    // -------------------------------------------------------------------------
+    // options
+    // -------------------------------------------------------------------------
+    // Pipeline-level behaviour flags. These apply globally rather than having
+    // to be duplicated inside every stage.
+    // -------------------------------------------------------------------------
+    options {
+        // Abort the build automatically if it has not finished within 30 minutes.
+        // Without a timeout a hung build (e.g. a test waiting for a service that
+        // never comes up) will hold an executor indefinitely and block other work.
+        timeout(time: 30, unit: 'MINUTES')
+
+        // Keep logs and artefacts for the last 10 builds and for 30 days,
+        // whichever limit is hit first. This prevents unbounded disk growth on
+        // the Jenkins controller while still retaining enough history to
+        // investigate recent failures.
+        buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '30'))
+
+        // Print timestamps in front of every log line. Invaluable when
+        // diagnosing slow stages or comparing build durations over time.
+        timestamps()
+    }
+
+    // =========================================================================
+    // stages
+    // =========================================================================
+    // The `stages` block is the heart of a Declarative pipeline. Each `stage`
+    // represents a logical phase of the CI/CD workflow. Jenkins renders them as
+    // distinct coloured boxes in the Blue Ocean UI and on the classic build page,
+    // making it immediately obvious which phase failed.
+    // =========================================================================
+    stages {
+
+        // ---------------------------------------------------------------------
+        // Stage 1 — Checkout
+        // ---------------------------------------------------------------------
+        // Retrieves the source code from the version control system configured
+        // in the Jenkins job. `checkout scm` is a built-in Pipeline step that
+        // reads the SCM configuration from the job definition (branch, repo URL,
+        // credentials) so you never have to hard-code a repository URL here.
+        //
+        // After this step completes, Jenkins populates several built-in
+        // environment variables automatically:
+        //   GIT_COMMIT     — full 40-character SHA of the checked-out commit
+        //   GIT_BRANCH     — branch name (e.g. "main")
+        //   GIT_URL        — remote URL
+        // Our IMAGE_TAG variable (defined in the environment block above) is
+        // derived from GIT_COMMIT, so it becomes valid only AFTER this stage.
+        // ---------------------------------------------------------------------
+        stage('Checkout') {
+            steps {
+                // `checkout scm` delegates entirely to the SCM plugin (Git,
+                // Subversion, etc.) configured in the job. Jenkins clones (or
+                // fetches) the repository into the workspace directory on the
+                // build agent, then checks out the branch/commit that triggered
+                // the build. Any credentials needed for private repos are stored
+                // in Jenkins Credential Store and referenced by the job config —
+                // they never appear in this file.
+                checkout scm
+
+                // Echo a confirmation so the log shows exactly what was checked
+                // out. GIT_COMMIT and GIT_BRANCH are available after `checkout`.
+                echo "Checked out commit ${GIT_COMMIT} on branch ${GIT_BRANCH}"
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Stage 2 — Run Tests
+        // ---------------------------------------------------------------------
+        // Installs project dependencies inside an isolated Python virtual
+        // environment, then executes the pytest test suite. Running tests before
+        // building the Docker image means we fail fast — no point spending time
+        // building and scanning an image whose code doesn't even pass tests.
+        //
+        // Why a virtualenv?
+        //   The build agent may run many projects simultaneously, each with
+        //   different dependency versions. Installing into a venv scopes all
+        //   packages to this workspace, preventing version conflicts between
+        //   concurrent builds and leaving the agent's system Python untouched.
+        // ---------------------------------------------------------------------
+        stage('Run Tests') {
+            steps {
+                echo "Installing dependencies and running test suite..."
+
+                sh '''
+                    # ---- Create a fresh virtual environment ----
+                    # `python3 -m venv` creates a self-contained Python
+                    # environment in the .venv directory inside the workspace.
+                    # `-m venv` uses the standard-library venv module, which is
+                    # available in all Python 3.3+ installations without needing
+                    # a separately installed tool.
+                    python3 -m venv .venv
+
+                    # ---- Activate the virtual environment ----
+                    # Sourcing the activate script modifies PATH so that
+                    # `python` and `pip` within this shell session resolve to
+                    # the venv binaries rather than the system ones. The effect
+                    # is local to this `sh` block.
+                    . .venv/bin/activate
+
+                    # ---- Upgrade pip ----
+                    # The pip bundled with venv may be outdated. Upgrading it
+                    # avoids deprecation warnings and ensures compatibility with
+                    # the latest package metadata formats. `--quiet` suppresses
+                    # the verbose download progress output.
+                    pip install --quiet --upgrade pip
+
+                    # ---- Install project dependencies ----
+                    # requirements.txt at the repository root lists all runtime
+                    # and test dependencies. Installing from this file (rather
+                    # than ad-hoc `pip install <pkg>`) guarantees reproducibility
+                    # and keeps dependency management in one place.
+                    pip install --quiet -r requirements.txt
+
+                    # ---- Run the test suite ----
+                    # pytest discovers and runs all test files matching the
+                    # test_*.py / *_test.py conventions under app/tests/.
+                    #   -v  (verbose) prints one line per test so failures are
+                    #       immediately visible in the Jenkins log.
+                    #   --tb=short  prints a compact traceback for failures,
+                    #       which is easier to scan than the full traceback in
+                    #       a CI log.
+                    pytest app/tests/ -v --tb=short
+                '''
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Stage 3 — Build Docker Image
+        // ---------------------------------------------------------------------
+        // Builds the Docker image using the Dockerfile in the docker/ directory.
+        // The image is tagged with the short git commit hash so that every image
+        // can be traced back to the exact source commit that produced it.
+        //
+        // Why tag with the commit hash?
+        //   Immutable tags (commit hashes never change) make deployments
+        //   reproducible and rollbacks trivial — you always know precisely what
+        //   code is inside an image with a given tag. Mutable tags like "latest"
+        //   are convenient but can lead to "works on my machine" situations where
+        //   different hosts pulled different images under the same tag.
+        //
+        // Build context:
+        //   We pass `.` (the workspace root) as the build context so that the
+        //   COPY instructions in the Dockerfile can reference paths relative to
+        //   the repository root (e.g. `COPY requirements.txt .`, `COPY app/ .`).
+        //   The `-f` flag points explicitly at our Dockerfile location inside
+        //   the docker/ subdirectory.
+        // ---------------------------------------------------------------------
+        stage('Build Docker Image') {
+            steps {
+                echo "Building Docker image: ${DOCKER_IMAGE}:${IMAGE_TAG}"
+
+                sh """
+                    # `docker build` assembles the image layer-by-layer as
+                    # specified by the Dockerfile instructions.
+                    #
+                    # -t ${DOCKER_IMAGE}:${IMAGE_TAG}
+                    #       Tags the resulting image with our registry path and
+                    #       the short commit SHA. Without a tag, Docker assigns
+                    #       the image only a random ID.
+                    #
+                    # -f docker/Dockerfile
+                    #       Explicitly names the Dockerfile to use. Without -f,
+                    #       Docker looks for a file literally named "Dockerfile"
+                    #       in the build context root; ours is in a subdirectory
+                    #       so we must specify the path.
+                    #
+                    # .    (final argument)
+                    #       The build context — the directory tree that Docker
+                    #       makes available to COPY/ADD instructions during the
+                    #       build. Using the workspace root means COPY can reach
+                    #       both requirements.txt and the app/ directory.
+                    docker build \\
+                        -t ${DOCKER_IMAGE}:${IMAGE_TAG} \\
+                        -f docker/Dockerfile \\
+                        .
+                """
+
+                echo "Docker image built successfully: ${DOCKER_IMAGE}:${IMAGE_TAG}"
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Stage 4 — Security Scan
+        // ---------------------------------------------------------------------
+        // Scans the freshly built image with Trivy, an open-source container
+        // vulnerability scanner maintained by Aqua Security. Trivy checks every
+        // OS package and language-level dependency in the image against known
+        // CVE databases (NVD, GitHub Advisories, OS vendor advisories, etc.).
+        //
+        // Why scan BEFORE pushing?
+        //   Scanning the local image before it reaches the registry means
+        //   critically vulnerable images are never published. This is the "shift
+        //   left" security principle: catch problems as early as possible in the
+        //   pipeline rather than relying solely on post-publish scanning.
+        //
+        // Severity policy:
+        //   --exit-code 1 --severity CRITICAL
+        //   Trivy returns exit code 1 (failure) only when CRITICAL
+        //   vulnerabilities are found. HIGH, MEDIUM, LOW, and UNKNOWN
+        //   severities are reported but do not fail the build. Adjust
+        //   severity thresholds to match your organisation's risk appetite.
+        // ---------------------------------------------------------------------
+        stage('Security Scan') {
+            steps {
+                echo "Running Trivy security scan on ${DOCKER_IMAGE}:${IMAGE_TAG}..."
+
+                sh """
+                    # ---- Informational scan (all severities, no failure) ----
+                    # Run a full scan first so the complete picture appears in
+                    # the Jenkins log. This scan NEVER fails the build regardless
+                    # of what it finds — it is purely informational so engineers
+                    # can see the full vulnerability landscape.
+                    #
+                    # --format table   Human-readable ASCII table, ideal for CI
+                    #                  logs. Alternatives: json, sarif, template.
+                    # --exit-code 0    Always exits 0 (success) regardless of
+                    #                  findings — informational only.
+                    # --severity ...   Show all severity levels in this report.
+                    # --no-progress    Suppress the animated progress bar that
+                    #                  clutters CI logs with escape sequences.
+                    trivy image \\
+                        --format table \\
+                        --exit-code 0 \\
+                        --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \\
+                        --no-progress \\
+                        ${DOCKER_IMAGE}:${IMAGE_TAG}
+
+                    echo "--- Enforcing policy: failing on CRITICAL vulnerabilities ---"
+
+                    # ---- Policy-enforcing scan (CRITICAL only, build fails) ----
+                    # A second scan restricted to CRITICAL severity. Trivy will
+                    # return exit code 1 if any CRITICAL CVE is found, which
+                    # causes the `sh` step to throw an exception and fail the
+                    # stage (and therefore the build). Jenkins marks the build
+                    # as FAILURE, preventing the image from being pushed to the
+                    # registry.
+                    #
+                    # Running two scans (informational + policy) is intentional:
+                    # the first gives full visibility; the second enforces the
+                    # gate. A single scan with --exit-code 1 --severity CRITICAL
+                    # would hide lower-severity findings in the log on failure.
+                    trivy image \\
+                        --format table \\
+                        --exit-code 1 \\
+                        --severity CRITICAL \\
+                        --no-progress \\
+                        ${DOCKER_IMAGE}:${IMAGE_TAG}
+                """
+
+                echo "Security scan passed — no CRITICAL vulnerabilities found."
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Stage 5 — Push to Docker Hub
+        // ---------------------------------------------------------------------
+        // Authenticates with Docker Hub using credentials stored securely in the
+        // Jenkins Credential Store, then pushes the image with two tags:
+        //   1. The commit-hash tag  — immutable, traceable, for production use.
+        //   2. The "latest" tag     — a moving pointer, convenient for scripts
+        //                             and humans who just want "the newest image"
+        //                             without looking up a hash.
+        //
+        // Why use Jenkins credentials instead of plain environment variables?
+        //   Credentials stored in Jenkins are encrypted at rest and are never
+        //   written to the build log (Jenkins masks their values automatically).
+        //   Embedding plain-text passwords in environment variables or in this
+        //   file would expose them to anyone with log or code access.
+        //
+        // Credential ID:
+        //   "dockerhub-credentials" must be created in Jenkins under
+        //   Manage Jenkins > Credentials > (global) > Add Credentials as a
+        //   "Username with password" kind, with the ID set to exactly
+        //   "dockerhub-credentials".
+        // ---------------------------------------------------------------------
+        stage('Push to Docker Hub') {
+            steps {
+                echo "Pushing image to Docker Hub: ${DOCKER_IMAGE}"
+
+                // `withCredentials` injects the stored credentials into the
+                // block as environment variables. The `usernamePassword` binding
+                // maps:
+                //   credentialsId — the ID of the credential in Jenkins
+                //   usernameVariable — the shell var name for the username
+                //   passwordVariable — the shell var name for the password
+                // Jenkins automatically redacts the password value in all log
+                // output, replacing it with "****".
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-credentials',
+                    usernameVariable: 'DOCKER_USERNAME',
+                    passwordVariable: 'DOCKER_PASSWORD'
+                )]) {
+                    sh """
+                        # ---- Log in to Docker Hub ----
+                        # `--password-stdin` reads the password from standard
+                        # input rather than accepting it as a CLI argument.
+                        # Passing secrets as arguments is unsafe because they
+                        # appear in the process list (visible via `ps aux`) and
+                        # in shell history files. --password-stdin avoids both.
+                        echo "\${DOCKER_PASSWORD}" | docker login \\
+                            --username "\${DOCKER_USERNAME}" \\
+                            --password-stdin
+
+                        # ---- Push the commit-hash tag ----
+                        # This is the canonical, immutable tag for this build.
+                        # Downstream systems (Kubernetes manifests, Helm charts,
+                        # Terraform) should reference this tag so deployments are
+                        # fully reproducible and auditable.
+                        docker push ${DOCKER_IMAGE}:${IMAGE_TAG}
+
+                        # ---- Re-tag as "latest" ----
+                        # `docker tag` creates an alias in the local Docker
+                        # daemon — it does NOT copy image layers, so this is
+                        # effectively instantaneous. It simply associates a new
+                        # name/tag with the same image ID.
+                        docker tag ${DOCKER_IMAGE}:${IMAGE_TAG} ${DOCKER_IMAGE}:latest
+
+                        # ---- Push the "latest" tag ----
+                        # Pushing "latest" allows users and scripts to pull the
+                        # most recent image without knowing the exact commit hash.
+                        # Note: "latest" is a mutable pointer and should NOT be
+                        # relied on for production deployments where reproducibility
+                        # is required — use the commit-hash tag for that.
+                        docker push ${DOCKER_IMAGE}:latest
+                    """
+                }
+
+                echo "Successfully pushed ${DOCKER_IMAGE}:${IMAGE_TAG} and ${DOCKER_IMAGE}:latest"
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Stage 6 — Deploy
+        // ---------------------------------------------------------------------
+        // Stops and removes any previously running instance of the container,
+        // then starts a fresh container from the newly pushed image. This is a
+        // simple "stop-and-replace" deployment strategy suitable for single-host
+        // setups and development environments.
+        //
+        // For production workloads you would replace this stage with a call to
+        // a container orchestrator (Kubernetes `kubectl rollout`, Docker Swarm
+        // `docker service update`, AWS ECS, etc.) which can perform rolling
+        // updates with zero downtime and automatic rollback on health-check
+        // failure.
+        //
+        // Port mapping: host 5000 → container 5000.
+        //   The Flask application inside the container listens on port 5000
+        //   (as defined by the CMD in the Dockerfile). We map the same host
+        //   port so the service is reachable at http://<host>:5000.
+        // ---------------------------------------------------------------------
+        stage('Deploy') {
+            steps {
+                echo "Deploying ${APP_NAME} container..."
+
+                sh """
+                    # ---- Stop and remove the old container (if it exists) ----
+                    # `docker stop` sends SIGTERM to PID 1 inside the container,
+                    # giving the application a chance to shut down gracefully
+                    # (close connections, flush buffers, etc.). After a grace
+                    # period (default 10 s) Docker sends SIGKILL if the process
+                    # has not exited yet.
+                    #
+                    # `docker rm` removes the stopped container record from the
+                    # Docker daemon. Without rm, a new `docker run --name` with
+                    # the same name would fail because the name is still taken.
+                    #
+                    # `|| true` ensures the overall `sh` step does not fail if
+                    # no container with this name currently exists (e.g. on the
+                    # very first deployment). The `|| true` idiom swallows a
+                    # non-zero exit code from the preceding command.
+                    docker stop ${CONTAINER_NAME} || true
+                    docker rm   ${CONTAINER_NAME} || true
+
+                    # ---- Start the new container ----
+                    # docker run flags explained:
+                    #
+                    #   -d                Run in detached (background) mode so
+                    #                     the `sh` step returns immediately rather
+                    #                     than blocking until the container exits.
+                    #
+                    #   --name \${CONTAINER_NAME}
+                    #                     Assign a human-readable name so we can
+                    #                     stop/inspect it by name in later builds
+                    #                     and in `docker ps` output.
+                    #
+                    #   -p 5000:5000      Map TCP port 5000 on the host to port
+                    #                     5000 inside the container. Format is
+                    #                     <host-port>:<container-port>.
+                    #
+                    #   --restart unless-stopped
+                    #                     Automatically restart the container if
+                    #                     it crashes or if the Docker daemon is
+                    #                     restarted (e.g. after a host reboot),
+                    #                     unless it was explicitly stopped by the
+                    #                     operator. Keeps the service alive across
+                    #                     host reboots without needing systemd.
+                    #
+                    #   The final argument is the image to run: the commit-hash
+                    #   tag ensures we deploy exactly the image built in this
+                    #   pipeline run, not whatever "latest" happened to be.
+                    docker run -d \\
+                        --name ${CONTAINER_NAME} \\
+                        -p 5000:5000 \\
+                        --restart unless-stopped \\
+                        ${DOCKER_IMAGE}:${IMAGE_TAG}
+                """
+
+                echo "Deployment complete. ${APP_NAME} is running at http://localhost:5000"
+            }
+        }
+    }
+
+    // =========================================================================
+    // post
+    // =========================================================================
+    // The `post` block defines actions that run AFTER all stages have completed,
+    // regardless of whether the build succeeded or failed. Each named condition
+    // (`always`, `success`, `failure`, `unstable`, `changed`, `aborted`) maps
+    // to a different outcome state:
+    //
+    //   always   — runs unconditionally after every build
+    //   success  — runs only when the build result is SUCCESS
+    //   failure  — runs only when the build result is FAILURE
+    //
+    // Using `post` for cleanup and notifications is the correct place because:
+    //   1. It runs even if a stage throws an exception and aborts the build.
+    //   2. It separates cross-cutting concerns (notifications, cleanup) from
+    //      business logic (build, test, deploy stages).
+    // =========================================================================
+    post {
+
+        // ---------------------------------------------------------------------
+        // always — runs after every build (success, failure, aborted, etc.)
+        // ---------------------------------------------------------------------
+        // We unconditionally clean up Docker login credentials here. Even if
+        // the build fails mid-way (e.g. during the Security Scan before `docker
+        // login` was ever called), running `docker logout` is harmless — it just
+        // exits 0 immediately. The `|| true` below protects against a non-zero
+        // exit code in the unlikely event that Docker is unavailable.
+        //
+        // Why is cleanup critical?
+        //   After `docker login`, Docker writes credentials to the Docker config
+        //   file (~/.docker/config.json) on the agent's filesystem. If not
+        //   explicitly removed, those credentials persist between builds and
+        //   between different jobs running on the same agent, which is a
+        //   security risk — another job could push images to Docker Hub under
+        //   your account.
+        // ---------------------------------------------------------------------
+        always {
+            echo "--- Post-build cleanup ---"
+
+            sh '''
+                # Log out of Docker Hub to purge the stored credential from
+                # ~/.docker/config.json on the build agent. This ensures the
+                # credential is not accessible to subsequent builds running on
+                # the same agent node.
+                # `|| true` prevents the cleanup step itself from marking the
+                # build as failed if Docker is temporarily unavailable.
+                docker logout || true
+            '''
+
+            echo "Docker credentials cleared from agent."
+        }
+
+        // ---------------------------------------------------------------------
+        // success — runs only when every stage completed without error
+        // ---------------------------------------------------------------------
+        // In a production setup this block would send a Slack message, post a
+        // GitHub status check, or trigger a downstream pipeline. Here we use
+        // `echo` as a lightweight stand-in that is visible in the Jenkins
+        // console log without requiring additional plugin configuration.
+        // Replace the echo statements with your notification mechanism of choice
+        // (e.g. the Slack Notification plugin's `slackSend` step).
+        // ---------------------------------------------------------------------
+        success {
+            echo "============================================================"
+            echo " BUILD SUCCEEDED"
+            echo "------------------------------------------------------------"
+            echo " Application : ${APP_NAME}"
+            echo " Image       : ${DOCKER_IMAGE}:${IMAGE_TAG}"
+            echo " Container   : ${CONTAINER_NAME}"
+            echo " Endpoint    : http://localhost:5000"
+            echo " Branch      : ${GIT_BRANCH}"
+            echo " Commit      : ${GIT_COMMIT}"
+            echo "============================================================"
+            echo "NOTIFICATION: Pipeline succeeded — image pushed and container deployed."
+        }
+
+        // ---------------------------------------------------------------------
+        // failure — runs only when a stage or step returned a non-zero exit
+        //           code or threw an exception
+        // ---------------------------------------------------------------------
+        // Engineers should be notified immediately on failure so they can
+        // investigate and fix the issue before it blocks other team members.
+        // The echo here would be replaced by e.g. slackSend(color: 'danger', ...)
+        // or a call to a webhook in a real project.
+        // ---------------------------------------------------------------------
+        failure {
+            echo "============================================================"
+            echo " BUILD FAILED"
+            echo "------------------------------------------------------------"
+            echo " Application : ${APP_NAME}"
+            echo " Branch      : ${GIT_BRANCH}"
+            echo " Commit      : ${GIT_COMMIT}"
+            echo " Build URL   : ${BUILD_URL}"
+            echo "------------------------------------------------------------"
+            echo " Action required: check the stage logs above for the root"
+            echo " cause and fix the failing test, vulnerability, or step."
+            echo "============================================================"
+            echo "NOTIFICATION: Pipeline failed — review the Jenkins log at ${BUILD_URL}"
+        }
+    }
+}
