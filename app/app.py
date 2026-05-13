@@ -28,7 +28,7 @@ def create_app():
 
     @app.route("/", methods=["GET"])
     def index():
-        return jsonify({"message": "Welcome to the devops-cicd-pipeline API"}), 200
+        return jsonify({"message": "Welcome to the devops-cicd-pipeline API - v1.0.0"}), 200
 
     # -----------------------------------------------------------------------
     # Route: GET /health
